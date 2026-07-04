@@ -1,0 +1,1 @@
+/home/c03rad0r/.hermes/bot/session_registry.py

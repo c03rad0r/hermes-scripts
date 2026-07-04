@@ -1,0 +1,1 @@
+/home/c03rad0r/.hermes/profiles/manager/scripts/anomaly-notify.sh

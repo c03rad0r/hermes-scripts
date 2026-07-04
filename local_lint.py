@@ -1,0 +1,1 @@
+/home/c03rad0r/.hermes/bot/local_lint.py

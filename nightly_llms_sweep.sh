@@ -1,0 +1,1 @@
+/home/c03rad0r/.hermes/bot/nightly_llms_sweep.sh
