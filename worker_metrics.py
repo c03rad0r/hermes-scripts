@@ -88,25 +88,54 @@ def read_meminfo():
 def read_zai_state():
     """Read z.ai quota state for both keys.
 
-    Returns (our_peak_pct, friend_pct, throttle, friend_pause).
-    our_peak_pct = max(session_pct, token_pct) — the real consumption.
+    Returns dict with:
+      our_pct:       max(session_pct, token_pct) for our key
+      friend_pct:    friend's TOKENS_LIMIT peak
+      throttle:      0/1 — our key >= 80% (WARN_PCT)
+      critical:      0/1 — our key >= 92% (CRIT_PCT)
+      quota_pause:   0/1 — our token >= 85% (D-062, dispatch paused)
+      friend_pause:  0/1 — friend >= 40% (D-067, easing off)
+      active_key:    0=ours, 1=friend, 2=both_paused, 3=unknown
     """
     state_file = Path.home() / ".hermes" / "bot" / "zai_state.json"
+    defaults = {
+        "our_pct": 0, "friend_pct": 0,
+        "throttle": 0, "critical": 0, "quota_pause": 0, "friend_pause": 0,
+        "active_key": 3,
+    }
     if not state_file.exists():
-        return 0, 0, 0, 0
+        return defaults
     try:
         with open(state_file) as f:
             data = json.load(f)
-        our_peak = max(
+        our_pct = max(
             int(data.get("session_pct", 0)),
             int(data.get("token_pct", 0)),
         )
         friend_pct = int(data.get("friend_token_pct", 0))
         throttle = 1 if data.get("throttle", False) else 0
+        critical = 1 if data.get("critical", False) else 0
+        quota_pause = 1 if data.get("quota_pause", False) else 0
         friend_pause = 1 if data.get("friend_pause", False) else 0
-        return our_peak, friend_pct, throttle, friend_pause
+
+        # Determine which key the system would use right now
+        if quota_pause and friend_pause:
+            active_key = 2  # both throttled/paused
+        elif quota_pause and not friend_pause:
+            active_key = 1  # fallback to friend
+        elif not quota_pause:
+            active_key = 0  # using our key
+        else:
+            active_key = 3  # unknown
+
+        return {
+            "our_pct": our_pct, "friend_pct": friend_pct,
+            "throttle": throttle, "critical": critical,
+            "quota_pause": quota_pause, "friend_pause": friend_pause,
+            "active_key": active_key,
+        }
     except Exception:
-        return 0, 0, 0, 0
+        return defaults
 
 def read_dynamic_max():
     """Call compute_max_workers.py for the dynamic concurrency target."""
@@ -164,7 +193,14 @@ def collect():
     swap_pct = (swap_used_kb / swap_total_kb * 100) if swap_total_kb > 0 else 0
 
     # API signals
-    api_pct, friend_pct, api_throttle, friend_pause = read_zai_state()
+    zai = read_zai_state()
+    api_pct = zai["our_pct"]
+    friend_pct = zai["friend_pct"]
+    api_throttle = zai["throttle"]
+    api_critical = zai["critical"]
+    quota_pause = zai["quota_pause"]
+    friend_pause = zai["friend_pause"]
+    active_key = zai["active_key"]
 
     # Dynamic concurrency
     max_concurrent = read_dynamic_max()
@@ -215,19 +251,36 @@ def collect():
             tasks_done INT
         )
     """)
-    # Migration: add friend column to existing DBs
-    try:
-        conn.execute("ALTER TABLE worker_metrics ADD COLUMN api_quota_friend_pct INT DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    conn.execute(
-        """INSERT INTO worker_metrics VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (ts, load1, load5, lpc, mem_pct, mem_avail_mb,
-         swap_used_kb, swap_pct, worker_count, max_concurrent,
-         api_pct, api_throttle, friend_pct,
-         task_counts["ready"], task_counts["running"],
-         task_counts["blocked"], task_counts["done"]),
-    )
+    # Migrations: add new columns to existing DBs
+    for col in ["api_quota_friend_pct INT DEFAULT 0",
+                "api_critical INT DEFAULT 0",
+                "api_quota_pause INT DEFAULT 0",
+                "api_friend_pause INT DEFAULT 0",
+                "api_active_key INT DEFAULT 0"]:
+        col_name = col.split()[0]
+        try:
+            conn.execute(f"ALTER TABLE worker_metrics ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # Build column list dynamically (old rows won't have all columns)
+    all_cols = [r[1] for r in conn.execute("PRAGMA table_info(worker_metrics)").fetchall()]
+    placeholders = ",".join("?" * len(all_cols))
+    col_names = ",".join(all_cols)
+    values = {
+        "ts": ts, "load1": load1, "load5": load5, "load_per_core": lpc,
+        "mem_pct": mem_pct, "mem_avail_mb": mem_avail_mb,
+        "swap_used_kb": swap_used_kb, "swap_pct": swap_pct,
+        "workers": worker_count, "max_concurrent": max_concurrent,
+        "api_quota_pct": api_pct, "api_throttle": api_throttle,
+        "api_quota_friend_pct": friend_pct,
+        "api_critical": api_critical, "api_quota_pause": quota_pause,
+        "api_friend_pause": friend_pause, "api_active_key": active_key,
+        "tasks_ready": task_counts["ready"], "tasks_running": task_counts["running"],
+        "tasks_blocked": task_counts["blocked"], "tasks_done": task_counts["done"],
+    }
+    row_vals = [values.get(c, 0) for c in all_cols]
+    conn.execute(f"INSERT INTO worker_metrics ({col_names}) VALUES ({placeholders})", row_vals)
     conn.commit()
     conn.close()
 

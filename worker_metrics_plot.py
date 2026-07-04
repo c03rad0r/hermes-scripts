@@ -74,6 +74,38 @@ def fmt_ts(ts):
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
 
+def _add_key_bands(fig, ts_raw, active_keys, colors, labels, row):
+    """Add colored background rectangles for active-key state transitions."""
+    if not ts_raw:
+        return
+    # Find contiguous segments with the same active_key
+    segments = []
+    start_idx = 0
+    current_key = active_keys[0]
+    for i in range(1, len(active_keys)):
+        if active_keys[i] != current_key:
+            segments.append((start_idx, i - 1, current_key))
+            start_idx = i
+            current_key = active_keys[i]
+    segments.append((start_idx, len(active_keys) - 1, current_key))
+
+    for start_i, end_i, key_val in segments:
+        x0 = ts_raw[start_i]
+        x1 = ts_raw[end_i]
+        color = colors.get(key_val, colors[3])
+        label = labels.get(key_val, labels[3])
+        # Only label segments wider than ~15min to avoid clutter
+        duration_pts = end_i - start_i
+        annot = label if duration_pts > 3 else ""
+        fig.add_vrect(
+            x0=x0, x1=x1,
+            fillcolor=color, layer="below", line_width=0,
+            annotation_text=annot, annotation_position="top left",
+            annotation_font=dict(size=8, color="#888"),
+            row=row, col=1,
+        )
+
+
 def create_dashboard(data, out_path):
     """Create a multi-subplot Plotly HTML dashboard."""
     ts_labels = [fmt_ts(r["ts"]) for r in data]
@@ -88,7 +120,7 @@ def create_dashboard(data, out_path):
             "Load Average (1-min)",
             "Memory Usage",
             "Workers vs Dynamic Max",
-            "z.ai API Quota",
+            "z.ai API Quota + Key Selection",
             "Kanban Task Counts",
         ),
         row_heights=[0.22, 0.22, 0.22, 0.17, 0.17],
@@ -152,7 +184,7 @@ def create_dashboard(data, out_path):
         row=3, col=1,
     )
 
-    # ─── Row 4: API Quota ─────────────────────────────────
+    # ─── Row 4: API Quota + Key Selection ──────────────────
     fig.add_trace(
         go.Scatter(x=ts_raw, y=[r["api_quota_pct"] for r in data],
                    name="z.ai (ours)", line=dict(color="#dcdcaa", width=1.5),
@@ -170,6 +202,37 @@ def create_dashboard(data, out_path):
                    customdata=ts_labels),
         row=4, col=1,
     )
+    # Active-key decision band: color the background by which key is active
+    # 0=ours(green), 1=friend(orange), 2=both_paused(red), 3=unknown(gray)
+    key_labels = {0: "OUR KEY", 1: "FRIEND KEY", 2: "BOTH PAUSED", 3: "UNKNOWN"}
+    key_colors = {0: "rgba(78,201,176,0.08)", 1: "rgba(224,108,117,0.08)",
+                  2: "rgba(255,0,0,0.12)", 3: "rgba(128,128,128,0.05)"}
+    active_keys = [r.get("api_active_key", 0) or 0 for r in data]
+    _add_key_bands(fig, ts_raw, active_keys, key_colors, key_labels, row=4)
+
+    # Throttle/pause event markers
+    throttle_pts = [(ts_raw[i], ts_labels[i]) for i in range(len(data))
+                    if (data[i].get("api_throttle", 0) or 0)]
+    if throttle_pts:
+        fig.add_trace(
+            go.Scatter(x=[p[0] for p in throttle_pts], y=[95] * len(throttle_pts),
+                       mode="markers", name="⚠ Throttle",
+                       marker=dict(color="#ff9e3d", size=6, symbol="triangle-up"),
+                       hovertemplate="<b>%{customdata}</b><br>THROTTLED<extra></extra>",
+                       customdata=[p[1] for p in throttle_pts]),
+            row=4, col=1,
+        )
+    pause_pts = [(ts_raw[i], ts_labels[i]) for i in range(len(data))
+                 if (data[i].get("api_quota_pause", 0) or 0)]
+    if pause_pts:
+        fig.add_trace(
+            go.Scatter(x=[p[0] for p in pause_pts], y=[90] * len(pause_pts),
+                       mode="markers", name="⛔ Pause",
+                       marker=dict(color="#ff0000", size=8, symbol="x"),
+                       hovertemplate="<b>%{customdata}</b><br>QUOTA PAUSE<extra></extra>",
+                       customdata=[p[1] for p in pause_pts]),
+            row=4, col=1,
+        )
     fig.add_hline(y=85, line_dash="dash", line_color="#e06c75", line_width=0.5,
                   annotation_text="BLOCK 85%", row=4, col=1)
 
